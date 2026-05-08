@@ -39,6 +39,8 @@ Full reference for the in-process Lua 5.4 scripting tab.
    - [JSON](#json)
    - [Persistent storage](#persistent-storage)
    - [Filesystem](#filesystem)
+   - [Dynamic execution](#dynamic-execution)
+   - [HTTP](#http)
    - [Callbacks](#callbacks)
    - [Object reflection](#object-reflection)
    - [PlayerController helpers](#playercontroller-helpers)
@@ -1349,6 +1351,72 @@ Useful for loading user-supplied snippets (e.g. via `cathack.read_file` / `catha
 
 ---
 
+### HTTP
+
+The HTTP module is built on **WinHTTP** with HTTP/2 + TLS 1.2/1.3 enabled and a process-wide connection pool. Repeat calls to the same host avoid the TCP/TLS handshake. All successful responses are cached in memory for 5 minutes by URL — most "load a remote script" patterns end up effectively free after the first call.
+
+The Roblox-style `game:HttpGet(url)` global is also available; under the hood it routes to the same code as `cathack.http_get` so the two share the cache.
+
+#### `cathack.http_get(url, opts?) -> body | nil, err`
+
+Synchronous HTTP GET. Blocks the calling thread (game or render) until the response arrives. Default 5 second timeout, default 16 MB body cap, automatic 4xx/5xx → error conversion.
+
+`opts` is an optional table:
+- `timeout_ms` — number, override the receive timeout in milliseconds.
+- `no_cache`   — bool, skip the in-memory cache (both lookup and store).
+
+Returns the response body as a Lua string on success. Returns `nil, err` on network failure, parse failure, or non-2xx status (`err` will be `"HTTP 404"` etc.).
+
+```lua
+-- Canonical "load remote script" pattern
+local code, err = cathack.http_get("https://example.com/util.lua")
+if code then
+    local fn, lerr = load(code, "@util")
+    if fn then fn() else print(lerr) end
+else
+    print("download failed:", err)
+end
+
+-- Force a fresh fetch, no cache
+local body = cathack.http_get(url, { no_cache = true, timeout_ms = 10000 })
+```
+
+#### `game:HttpGet(url) -> body`  (Roblox-style)
+
+Mirrors Roblox's `game:HttpGet`. Synchronous; **raises a Lua error on failure** instead of returning `nil, err`. Use `pcall` if you don't want the script to crash on a bad URL.
+
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/user/repo/main/lib.lua"))()
+```
+
+Both `game:HttpGet` (method form) and `game.HttpGet` (bare-call form) work. A lowercase alias `game.http_get` is also registered for the case-insensitive crowd.
+
+#### `cathack.http_get_async(url, callback, opts?) -> bool`
+
+Non-blocking GET. Returns immediately. The worker runs on a detached thread; the callback fires on the **render thread** during `TickRender`, before any drawing for that frame, so values it sets are visible to `on_render` immediately.
+
+Callback signature: `function(body_or_nil, err_or_nil) end`
+
+```lua
+local code = nil
+cathack.http_get_async("https://example.com/big.lua", function(body, err)
+    if body then code = body else print("err:", err) end
+end)
+
+-- Some frames later, code is populated
+cathack.on_render(function()
+    if code then cathack.draw_text(20, 20, "got " .. #code .. " bytes", 0xFFFFFFFF) end
+end)
+```
+
+Cache hits return through the same path on the next render frame (no thread spawned).
+
+#### `cathack.http_clear_cache()`
+
+Drops every cached response. Connection pool is left intact (dropping it would just re-cost the next TLS handshake).
+
+---
+
 ### Callbacks
 
 Callback handles are integers (Lua registry references). Hold onto the value `on_tick` / `on_render` returns if you want to remove a single callback later.
@@ -2193,6 +2261,43 @@ end)
 
 ---
 
+### 16. Loadstring from a remote URL
+
+Canonical "fetch and run a remote Lua file" pattern. The first call pays for the TLS handshake; subsequent calls hit the in-memory cache for ~free.
+
+```lua
+-- Roblox-style — raises on failure, simplest to read
+loadstring(game:HttpGet("https://raw.githubusercontent.com/user/repo/main/lib.lua"))()
+
+-- Defensive form — no errors, you decide what to do
+local code, err = cathack.http_get("https://example.com/util.lua")
+if not code then
+    cathack.notify("download failed: " .. err)
+    return
+end
+
+local fn, lerr = load(code, "@util")
+if not fn then
+    cathack.notify("compile failed: " .. lerr)
+    return
+end
+
+local ok, run_err = pcall(fn)
+if not ok then cathack.notify("run failed: " .. run_err) end
+```
+
+For a non-blocking variant (won't stall the frame on a cold connection):
+
+```lua
+cathack.http_get_async("https://example.com/util.lua", function(body, err)
+    if not body then return cathack.notify(err) end
+    local fn = load(body, "@util")
+    if fn then pcall(fn) end
+end)
+```
+
+---
+
 ## Limitations and gotchas
 
 - **`Stop` now unregisters callbacks.** Stop sweeps every `on_tick` / `on_render` callback the script's last `Run` registered (tagged at registration time with the running script's name) and frees them. Lua globals / closures the script defined in the VM are not touched — those stay until you click **Reset VM** or another script reassigns them.
@@ -2232,6 +2337,12 @@ end)
 - **Reflection writes are bounded.** `object_set` refuses pointer types, `FName` writes, and any struct other than `Vector`/`Rotator`/`Vector2D`. `object_call` refuses functions whose params include object pointers, classes, arrays/maps/sets, text, or unknown structs. The whitelist exists so a malformed write can't corrupt UE's GC roots.
 
 - **`object_call` runs on whichever thread invoked it.** From `on_tick` it runs on the game thread (safe for most UE calls). From `on_render` it runs on the render thread (still serialized through the Lua mutex but **not** safe for every UE call — engine code that touches actor lifetimes generally expects the game thread). When in doubt, do reflection work in `on_tick`.
+
+- **`http_get` and `game:HttpGet` block.** The synchronous form holds the Lua mutex *and* the calling thread (game or render) for the entire round-trip. With cache hits this is microseconds; with a cold TLS connection to a slow CDN it can be a couple of hundred ms — long enough to register as a frame-time spike. Use `http_get_async` if you have a non-blocking path. The 5 s default timeout caps the worst case.
+
+- **HTTP cache is in-memory only.** `cathack.store`/`fetch` is the path for cross-session persistence. The HTTP cache lives until the DLL unloads (or `cathack.http_clear_cache()`), and cache hits don't re-validate with the server — pass `no_cache = true` in opts to bypass. Failures are not cached.
+
+- **`game:HttpGet` raises on non-2xx.** Roblox-style behavior: a 404 / network error is a Lua error, not a `(nil, err)` return. Wrap in `pcall` if you don't want script death on a bad URL. The `cathack.http_get` form returns `nil, err` instead and is generally easier to handle.
 
 ---
 
@@ -2427,6 +2538,13 @@ cathack.write_file(name, contents) -> bool
 
 -- Dynamic execution
 cathack.run_string(code, chunk_name?) -> bool [, err]
+
+-- HTTP
+cathack.http_get(url, opts?) -> body | nil, err          -- sync GET, 5s default timeout, 5min cache
+cathack.http_get_async(url, callback, opts?) -> bool      -- async; callback(body, err) on render thread
+cathack.http_clear_cache()                                -- drop cached responses
+game:HttpGet(url) -> body                                 -- Roblox-style sync GET (errors on failure)
+-- opts table: { timeout_ms = 5000, no_cache = false }
 
 -- Callbacks (per-frame ticks)
 local h = cathack.on_tick(function(dt) end)
