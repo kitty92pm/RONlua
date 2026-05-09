@@ -25,6 +25,7 @@ Full reference for the in-process Lua 5.4 scripting tab.
    - [Color helpers](#color-helpers)
    - [Screen / projection](#screen--projection)
    - [Input](#input)
+   - [Text editing helper](#text-editing-helper)
    - [Mouse + cursor + capture](#mouse--cursor--capture)
    - [Cheat menu state](#cheat-menu-state)
    - [Time / framerate](#time--framerate)
@@ -728,6 +729,101 @@ end
 ```
 
 Returns `nil` when off-screen / behind camera.
+
+---
+
+### Text editing helper
+
+Building a text input field by hand involves three subtle issues that bite every script author the first time:
+- Arrow keys do not produce `WM_CHAR`, so they never appear in `chars_typed()` or `on_char` — `chars_typed()` alone can't move the caret.
+- Backspace **does** appear in `chars_typed()` as raw byte `0x08`. The classic bug is `state.text = state.text .. cathack.chars_typed()` which concats a literal `\b` byte instead of erasing.
+- Holding a key needs auto-repeat at the OS keyboard rate. `cathack.on_key_pressed` only fires once per discrete press; you have to either pass `repeat = true` to `cathack.key_pressed` or read events from the unified queue.
+
+`cathack.text_input(state[, opts])` solves all three and lets a Lua text input be one call per frame.
+
+#### `cathack.text_input(state[, opts]) -> state`
+
+Mutates `state` in-place from this frame's input events and returns it for chaining.
+
+**State fields** (all optional on input, always written on output):
+- `text` — the buffer (string).
+- `caret` — caret position in bytes, `0..#text`.
+- `sel_anchor` — when set, marks the other end of a selection. The selection range is `[min(caret, sel_anchor), max(...)]`. `nil` means no selection.
+- `submit` — set `true` on output when Enter was pressed this frame (single-line mode only).
+
+**Opts fields**:
+- `max_length` — int. Inserts beyond this length are truncated.
+- `multiline` — bool. When `false` (default) Enter sets `submit` and is not inserted. When `true`, Enter inserts `\n`.
+
+**What it handles**:
+- Printable insert (UTF-8, multi-byte safe — Ctrl+letter chords are skipped because they're hotkeys).
+- Backspace, Delete (deletes selection if there is one, otherwise the char on the relevant side of the caret).
+- Left / Right arrow (UTF-8 boundary-aware).
+- Ctrl+Left / Ctrl+Right (word-jump).
+- Shift+arrow / Shift+Home / Shift+End (selection grow).
+- Home, End.
+- Ctrl+A (select all), Ctrl+C (copy), Ctrl+X (cut), Ctrl+V (paste — strips CRLF; drops `\n` when not multiline).
+- Auto-repeat: every WM_KEYDOWN with the repeat flag set is consumed, so holding a key walks the caret / repeats the action at the OS repeat rate.
+
+```lua
+-- @autorun
+local field = { text = "", caret = 0 }
+
+cathack.on_render(function()
+    cathack.capture_keyboard(true)            -- claim keys this frame
+    cathack.text_input(field, { max_length = 64 })
+
+    cathack.draw_rect_filled(40, 40, 320, 28, 0xC0202020, 4)
+    cathack.draw_rect       (40, 40, 320, 28, cathack.accent_color(), 1)
+    cathack.draw_text(48, 46, field.text, 0xFFFFFFFF)
+
+    -- Caret
+    local before = field.text:sub(1, field.caret)
+    local cw     = cathack.measure_text(before)
+    if cathack.frame_count() % 60 < 30 then
+        cathack.draw_rect_filled(48 + cw, 44, 2, 18, 0xFFFFFFFF)
+    end
+
+    if field.submit then
+        cathack.notify("submitted: " .. field.text)
+        field.text, field.caret = "", 0
+    end
+end)
+```
+
+#### `cathack.input_events() -> array of event tables`
+
+Returns the full per-frame ordered stream of input events — `WM_CHAR` codepoints and `WM_KEY*DOWN` / `WM_KEY*UP` transitions interleaved in arrival order. Same data the helper above eats. Use this when you want to roll your own editor or do something exotic.
+
+Each event is:
+```lua
+{ kind = "char",     codepoint = 65, text = "A",
+  repeated = false, shift = false, ctrl = false, alt = false }
+
+{ kind = "key_down", vk = 0x25,        -- VK_LEFT
+  repeated = true,  shift = false, ctrl = false, alt = false }
+
+{ kind = "key_up",   vk = 0x25,
+  repeated = false, shift = false, ctrl = false, alt = false }
+```
+
+The snapshot is taken at the top of `TickRender` — every call within the same frame returns the same array.
+
+#### `cathack.key_events() -> array of event tables`
+
+Same data as `input_events` but only the `key_down` / `key_up` rows. Matches what `on_key_pressed` sees, **plus** auto-repeat key-downs that `on_key_pressed` filters out. Use this when you specifically want navigation-key behavior (arrows / backspace / delete with hold-to-repeat) without dealing with the char rows.
+
+```lua
+for _, ev in ipairs(cathack.key_events()) do
+  if ev.kind == "key_down" and ev.vk == 0x25 then  -- VK_LEFT
+    cursor = math.max(0, cursor - 1)
+  end
+end
+```
+
+#### `cathack.chars_typed_printable() -> string`
+
+Like `cathack.chars_typed()` but with C0 controls (`0x00..0x1F`) and DEL (`0x7F`) stripped. Use this when you want to append printable insertion text to a buffer and are reading navigation keys from `key_events()` separately.
 
 ---
 
@@ -2217,44 +2313,61 @@ end)
 
 ---
 
-### 15. Search bar that consumes typing
+### 15. Search bar that consumes typing (with arrow-key navigation)
 
-Captures text input into a buffer using `chars_typed()` + `key_pressed`. Clicking the bar grabs keyboard focus so the player doesn't strafe while typing.
+Uses `cathack.text_input` so arrows / backspace / delete / home / end / shift-select / Ctrl+A / C / X / V all work, plus auto-repeat from holding a key. Clicking the bar grabs keyboard focus so the player doesn't strafe while typing.
 
 ```lua
 -- @autorun
-local bar = { x = 80, y = 80, w = 280, h = 28, focus = false, text = "" }
+local bar = {
+  x = 80, y = 80, w = 280, h = 28, focus = false,
+  state = { text = "", caret = 0 },
+}
 
 cathack.on_render(function()
   local hov = cathack.mouse_in_rect(bar.x, bar.y, bar.w, bar.h)
-  if hov and cathack.mouse_clicked(0) then
-    bar.focus = true
-    cathack.capture_mouse(true)
-  elseif cathack.mouse_clicked(0) then
-    bar.focus = false
+  if cathack.mouse_clicked(0) then
+    bar.focus = hov
+    if hov then cathack.capture_mouse(true) end
   end
 
   if bar.focus then
     cathack.capture_keyboard(true)
-    bar.text = bar.text .. cathack.chars_typed()
-    if cathack.key_pressed(0x08) and #bar.text > 0 then  -- VK_BACK
-      bar.text = bar.text:sub(1, -2)
+    cathack.text_input(bar.state, { max_length = 64 })
+
+    -- Escape unfocuses without committing
+    for _, ev in ipairs(cathack.key_events()) do
+      if ev.kind == "key_down" and ev.vk == 0x1B then bar.focus = false end
     end
-    if cathack.key_pressed(0x1B) then bar.focus = false end -- VK_ESCAPE
+    if bar.state.submit then
+      cathack.notify("search: " .. bar.state.text)
+      bar.state.text, bar.state.caret = "", 0
+    end
   end
 
   local theme = cathack.theme()
   cathack.draw_rect_filled(bar.x, bar.y, bar.w, bar.h, theme.background, 4)
   cathack.draw_rect(bar.x, bar.y, bar.w, bar.h,
     bar.focus and theme.accent or theme.border, 1)
-  local label = (#bar.text == 0) and "Search…" or bar.text
+
+  -- Selection highlight
+  if bar.state.sel_anchor then
+    local lo = math.min(bar.state.sel_anchor, bar.state.caret)
+    local hi = math.max(bar.state.sel_anchor, bar.state.caret)
+    local sx = cathack.measure_text(bar.state.text:sub(1, lo))
+    local sw = cathack.measure_text(bar.state.text:sub(lo + 1, hi))
+    cathack.draw_rect_filled(bar.x + 8 + sx, bar.y + 6, sw, 14,
+      cathack.lerp_color(theme.accent, 0x00000000, 0.6))
+  end
+
+  local label = (#bar.state.text == 0 and not bar.focus) and "Search…" or bar.state.text
   cathack.draw_text(bar.x + 8, bar.y + 6, label,
-    (#bar.text == 0) and 0x80FFFFFF or theme.text)
+    (#bar.state.text == 0 and not bar.focus) and 0x80FFFFFF or theme.text)
 
   -- Caret
   if bar.focus and (cathack.frame_count() % 60 < 30) then
-    local w = cathack.measure_text(bar.text)
-    cathack.draw_rect_filled(bar.x + 8 + w, bar.y + 6, 2, 14, theme.text)
+    local cw = cathack.measure_text(bar.state.text:sub(1, bar.state.caret))
+    cathack.draw_rect_filled(bar.x + 8 + cw, bar.y + 6, 2, 14, theme.text)
   end
 end)
 ```
@@ -2329,6 +2442,10 @@ end)
 - **Texture loading is render-thread only.** `cathack.load_texture` calls D3D11 directly on the immediate context. Calling it from `on_tick` is unsafe, so the binding short-circuits to `nil`. Always load textures from the chunk top-level or inside `on_render` (typically guarded with `if not tex then tex = cathack.load_texture(...) end`).
 
 - **Event callbacks fire before `on_render`.** `on_key_pressed` / `on_mouse_*` / `on_char` all dispatch at the top of the render frame. Side effects they make to script-side state (e.g. appending to `search_buffer`) are visible to `on_render` callbacks during the same frame.
+
+- **`on_key_pressed` doesn't auto-repeat — `key_events()` does.** The callback hook only fires on a discrete key transition, the same as `cathack.key_pressed(vk, false)`. For text editing where holding the arrow / backspace should repeat at the OS keyboard rate, either pass `repeat = true` to the polling form or read `cathack.key_events()` (which carries the repeat flag) — that's what `cathack.text_input` does internally.
+
+- **`chars_typed()` includes control characters.** Backspace arrives as `0x08`, Enter as `0x0D`, etc. The classic foot-gun is `state.text = state.text .. cathack.chars_typed()` which appends the raw control byte. Either use `chars_typed_printable()` or `text_input(state)` — the helper reads navigation keys from the unified event queue and never interleaves them as raw bytes.
 
 - **JSON is best-effort.** `json_encode` rejects functions / userdata / threads with a Lua error, doesn't detect cycles (the watchdog catches infinite recursion), and treats sparse-array tables as objects. Round-tripping numbers preserves integers when they're representable as such.
 
@@ -2439,7 +2556,11 @@ cathack.world_to_screen(x, y, z) -> sx, sy, ok | nil
 cathack.key(vk) -> bool
 cathack.key_pressed(vk[, repeat]) -> bool
 cathack.key_released(vk) -> bool
-cathack.chars_typed() -> string
+cathack.chars_typed() -> string                            -- raw, includes 0x08/etc.
+cathack.chars_typed_printable() -> string                  -- same but C0/DEL stripped
+cathack.input_events() -> array of {kind,codepoint|vk,text?,repeated,shift,ctrl,alt}
+cathack.key_events() -> array (same shape, key_down/key_up only — auto-repeat included)
+cathack.text_input(state[, opts]) -> state                 -- full text editing, see below
 cathack.time() -> ms
 cathack.delta_time() -> seconds
 cathack.fps() -> n
