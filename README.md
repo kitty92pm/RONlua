@@ -43,6 +43,16 @@ Full reference for the in-process Lua 5.4 scripting tab.
    - [Dynamic execution](#dynamic-execution)
    - [HTTP](#http)
    - [ImGui](#imgui)
+   - [Script lifecycle callbacks](#script-lifecycle-callbacks)
+   - [Timers and async tasks](#timers-and-async-tasks)
+   - [Property change watch](#property-change-watch)
+   - [Structured logging](#structured-logging)
+   - [Object browsing](#object-browsing)
+   - [Enum reflection](#enum-reflection)
+   - [ImGui layout persistence](#imgui-layout-persistence)
+   - [Config profiles](#config-profiles)
+   - [Keybind manager](#keybind-manager)
+   - [Command palette](#command-palette)
    - [Callbacks](#callbacks)
    - [Object reflection](#object-reflection)
    - [PlayerController helpers](#playercontroller-helpers)
@@ -1767,6 +1777,322 @@ end
 
 ImGui IDs are derived from the label, so duplicate labels in the same window create conflicting widgets. `imgui_push_id(string|int)` namespaces them.
 
+#### Vector / rotator widgets
+
+```lua
+local v, changed = cathack.imgui_input_vector("Position",  { x = 0, y = 0, z = 0 } [, speed=1] [, fmt="%.2f"])
+local r, changed = cathack.imgui_input_rotator("Rotation", { pitch = 0, yaw = 0, roll = 0 } [, speed=1] [, fmt="%.1f"])
+local v, changed = cathack.imgui_input_vector2("UV",       { x = 0, y = 0 })
+```
+
+Round-trip the same `{ x, y, z }` / `{ pitch, yaw, roll }` / `{ x, y }` table shapes the rest of the API speaks (e.g. `cathack.player_pos()`, struct properties from `cathack.object_get`).
+
+#### Cathack-themed widgets
+
+Convenience wrappers around the core ImGui calls with the menu's accent + rounding so script-built UI looks like it belongs in the cheat menu.
+
+```lua
+if cathack.imgui_card("Aim settings") then
+    cathack.imgui_subheader("Targets")
+    cathack.imgui_text("…")
+end
+cathack.imgui_end_card()         -- ALWAYS pair with end_card
+
+local v, changed = cathack.imgui_toggle("Smooth aim", v)   -- pill-shaped toggle
+if cathack.imgui_accent_button("Run") then …  end          -- accent-colored
+if cathack.imgui_danger_button("Reset config") then … end  -- red-themed
+```
+
+#### Combo backed by a UEnum
+
+```lua
+local enum_id = cathack.find_enum("EFoo")           -- nil if not loaded
+local values  = enum_id and cathack.enum_values(enum_id) or {
+    A = 0, B = 1, C = 2,
+}
+state.foo, _ = cathack.imgui_combo_enum("Foo mode", state.foo, values)
+```
+
+#### Keybind UI
+
+```lua
+cathack.bind_key("toggle_esp", 0x60, function()  -- VK_NUMPAD0 default
+    cathack.set("esp", not cathack.get("esp"))
+end, "Toggle ESP")
+
+cathack.imgui_text("ESP toggle:")
+cathack.imgui_same_line()
+cathack.imgui_keybind_button("toggle_esp")
+```
+
+`imgui_keybind_button` renders the current key (or "[unset]"); clicking it puts the binding into "press a key to bind" mode for the next frame. Esc cancels. The new key is persisted to `%APPDATA%/cathack/lua/keybinds.json` automatically.
+
+---
+
+### Script lifecycle callbacks
+
+Fired by `Run` / `Stop` / `ReloadScript` (whether you click the buttons in the Lua tab or another script does it programmatically). Useful when one script wants to react to its peers — e.g. a debug HUD that hides itself when the main aimbot script is stopped, or a hot-reload-aware data source that re-emits the latest snapshot whenever any script reloads from disk.
+
+```lua
+cathack.on_script_load  (function(name) cathack.log.info("loaded "  .. name) end)
+cathack.on_script_unload(function(name) cathack.log.info("unloaded " .. name) end)
+cathack.on_script_reload(function(name) cathack.log.info("reloaded " .. name) end)
+```
+
+Each fans the script *name* as the only argument. They run on whichever thread triggered the lifecycle event (game thread for an auto-run during init, render thread when the user clicks Run/Stop/Reload in the menu).
+
+Returns the same integer handle as the other callback registrations — pass to `cathack.unhook(handle)` to remove.
+
+---
+
+### Timers and async tasks
+
+Cathack timers are driven from `TickGame` (the same ~60 Hz fan as `on_tick`), so resolution is ~16 ms. Don't try to use them for sub-frame timing — use `on_tick(fn)` and integrate `dt` for that.
+
+#### `cathack.set_timeout(ms, fn) -> handle`
+
+Fire `fn` once after `ms` milliseconds have elapsed. Returns the handle (also accepted by `unhook` and `clear_timer`).
+
+#### `cathack.set_interval(ms, fn) -> handle`
+
+Fire `fn` every `ms` milliseconds, starting `ms` after the call. The interval reschedules from "now" each fire, so a long stall (game lag spike) won't queue up missed ticks.
+
+```lua
+cathack.set_interval(500, function()
+    cathack.log.debug("hp = " .. (cathack.local_health() or "?"))
+end)
+
+local once = cathack.set_timeout(2000, function()
+    cathack.notify("Two seconds passed")
+end)
+-- cathack.clear_timer(once)  -- abort if needed
+```
+
+#### `cathack.clear_timer(handle) -> bool`
+
+Cancel a pending one-shot or stop a repeating interval. Equivalent to `cathack.unhook(handle)`.
+
+#### `cathack.queue_task(fn) -> handle`
+
+Run `fn` once on the next game tick. Useful for "do this after the current frame's reflection / drawing has settled".
+
+#### `cathack.queue_render_task(fn) -> handle`
+
+Same idea but on the next render frame. The function runs as if from inside an `on_render` callback — `cathack.draw_*` and the ImGui wrappers are usable.
+
+---
+
+### Property change watch
+
+Poll a UE property and fire a callback every time it changes.
+
+#### `cathack.watch_property(object_id, prop_name, fn [, interval_ms=100]) -> handle`
+
+```lua
+local pc = cathack.local_player_controller()
+cathack.watch_property(pc, "bShowMouseCursor", function(new_v, old_v)
+    cathack.log.info(string.format("cursor: %s -> %s", tostring(old_v), tostring(new_v)))
+end)
+```
+
+The first poll always fires (so scripts get an initial state). Subsequent fires only happen when `new_v ~= old_v` — for the small struct types (`Vector`, `Rotator`, `Vector2D`) we deep-compare numeric fields with a 1e-6 tolerance so jitter past the 5th decimal doesn't spam the callback.
+
+#### `cathack.unwatch(handle)` — `cathack.unhook(handle)` works too.
+
+The poll runs on the game thread under the same watchdog deadline as `on_tick`, so an expensive callback won't freeze the game; it'll just kill that one fire and log a `[lua watch]` error.
+
+---
+
+### Structured logging
+
+Levels: `debug` (10) < `info` (20) < `warn` (30) < `error` (40). Default level is `info`; `debug` is filtered out unless you opt in.
+
+```lua
+cathack.log.info("hello")
+cathack.log.warn("low on ammo", { hp = 32, ammo = 7 })
+cathack.log.error("nil deref in hud", { trace = debug.traceback() })
+
+cathack.log.set_level("debug")          -- "debug" | "info" | "warn" | "error"
+print(cathack.log.level())              -- "DEBUG"
+
+local recent = cathack.log.entries(50)  -- last 50 entries: { time_ms, level, text }
+cathack.log.clear()
+```
+
+Every entry lands in the script console with a `[INFO]` / `[WARN]` / etc. prefix. Fields tables are inlined as `{key=val, key=val}` — keep them small and string/number-valued for readability. `cathack.log_*(...)` works as an alias for `cathack.log.*(...)` if you don't want the dotted access.
+
+---
+
+### Object browsing
+
+#### `cathack.count_objects() -> int`
+
+Returns the size of the global UObject array (the same `GObjects` UE uses internally).
+
+#### `cathack.find_object(class_name, object_name) -> object_id | nil`
+
+Find a single object by exact class + name. Either argument can be empty to skip that filter, but at least one should be set.
+
+```lua
+local mgr = cathack.find_object("ReadyOrNotGameInstance", "ReadyOrNotGameInstance_0")
+```
+
+#### `cathack.find_objects(filter_table) -> { object_id, ... }`
+
+Walks GObjects and returns up to `limit` (default 256, max 4096) objects matching the filter:
+
+```lua
+local actors = cathack.find_objects({
+    class_contains = "Pawn",       -- substring match against the UClass name (case-insensitive)
+    name_contains  = "BP_",        -- substring match against the object name
+    limit = 50,
+})
+for _, oid in ipairs(actors) do
+    cathack.log.info(cathack.object_path(oid))
+end
+```
+
+Filter keys (all optional, all combined with AND):
+
+| Key | Meaning |
+|---|---|
+| `class`           | Exact class name match (`"FunctionLibrary"`). |
+| `class_contains`  | Case-insensitive substring of the class name. |
+| `name`            | Exact object name. |
+| `name_contains`   | Case-insensitive substring of the object name. |
+| `limit`           | Max results. Default 256, capped at 4096. |
+
+Calls return immediately (no thread spawned) but a wide filter on a big game can still walk 100K+ entries — keep filters specific.
+
+---
+
+### Enum reflection
+
+#### `cathack.find_enum(name) -> object_id | nil`
+
+Look up a `UEnum` by name. Walks GObjects and matches `Class == "Enum" && name == ...`.
+
+```lua
+local e = cathack.find_enum("EReadyOrNotState")
+```
+
+#### `cathack.enum_values(enum_id) -> { [name] = int_value, ... }`
+
+Best-effort read of the `Names` array on the enum. Successful for almost every well-formed enum; returns an empty table when the engine version's UEnum layout differs from what we probe (try a couple of recently-discovered enums to confirm). Names are stripped of the `EFoo::` prefix when present, so the keys are just `Pending`, `Loading`, etc.
+
+```lua
+for name, value in pairs(cathack.enum_values(e)) do
+    print(name, value)
+end
+```
+
+Combine with the combo widget:
+
+```lua
+local values = cathack.enum_values(e)
+state.s, _ = cathack.imgui_combo_enum("State", state.s, values)
+```
+
+---
+
+### ImGui layout persistence
+
+Save / load the ImGui windows arrangement (positions, sizes, collapse state) so the user's layout survives DLL reloads.
+
+```lua
+cathack.layout_save("default")          -- captures current ImGui ini
+cathack.layout_load("comp")             -- restores a saved one
+local names = cathack.layout_list()     -- { "default", "comp", ... }
+cathack.layout_delete("scratch")
+```
+
+Files live in `%APPDATA%/cathack/lua/layouts/<name>.ini`. Backed by ImGui's `SaveIniSettingsToMemory` / `LoadIniSettingsFromMemory`, so this works in every ImGui build regardless of the docking compile flag.
+
+---
+
+### Config profiles
+
+JSON-backed profile saves for arbitrary script-side state (think "comp loadout", "video loadout", "casual loadout"). The script supplies the table to save; `profile_load` returns it.
+
+```lua
+cathack.profile_save("comp", {
+    aim_fov = 18, aim_smooth = 0.4,
+    esp = true,  esp_box = true,
+    keybinds = cathack.keybinds(),
+})
+local p = cathack.profile_load("comp")
+if p then
+    for k, v in pairs(p) do cathack.set(k, v) end
+end
+
+cathack.profile_list()   -- { "comp", "casual", "video" }
+cathack.profile_delete("scratch")
+```
+
+Files live in `%APPDATA%/cathack/lua/profiles/<name>.json` and round-trip through the same JSON encoder/decoder as `cathack.json_encode`.
+
+---
+
+### Keybind manager
+
+Persistent named bindings whose VK is stored on disk. The script associates a name with a function; the user re-binds the key in your UI; the new key sticks across VM restarts and DLL reloads.
+
+#### `cathack.bind_key(name, default_vk, fn [, description]) -> handle`
+
+```lua
+cathack.bind_key("toggle_esp", 0x60 --[[ VK_NUMPAD0 ]], function()
+    cathack.set("esp", not cathack.get("esp"))
+end, "Toggle ESP")
+```
+
+If a previous run persisted a key for `name`, the persisted VK wins over `default_vk`. Re-running the script auto-replaces the old binding (no duplicates).
+
+#### `cathack.set_keybind(name, vk)` — change the key programmatically (also writes to disk).
+
+#### `cathack.unbind_key(name)` — remove the binding entirely.
+
+#### `cathack.keybinds() -> { {name, key, description}, ... }` — snapshot for UI.
+
+#### `cathack.imgui_keybind_button(name)` — drop-in capture button (see ImGui section).
+
+---
+
+### Command palette
+
+Spotlight-style fuzzy-search palette. Scripts register commands with a stable `id`, a user-facing `title`, and a function. Users open the palette (e.g. via a keybind), type, and run.
+
+#### `cathack.register_command(id, title, fn [, opts]) -> handle`
+
+```lua
+cathack.register_command("esp.toggle", "ESP — Toggle", function()
+    cathack.set("esp", not cathack.get("esp"))
+end, { description = "Quick on/off for ESP", group = "Visuals" })
+```
+
+`opts` keys: `description` (tooltip + secondary search field), `group` (left side of the row label, e.g. `"Visuals — ESP — Toggle"`).
+
+#### `cathack.unregister_command(id) -> bool`
+
+#### `cathack.commands() -> { {id, title, description, group}, ... }` — snapshot.
+
+#### `cathack.show_command_palette([open=true])`
+
+Toggle the palette visible. The runtime renders it as the topmost ImGui window and steals keyboard input until you pick / dismiss.
+
+- ↑ / ↓ — change selection
+- Enter — run
+- Esc — close
+
+A common idiom is to bind it to a hotkey:
+
+```lua
+cathack.bind_key("palette", 0x71 --[[ VK_F2 ]], function()
+    cathack.show_command_palette(true)
+end, "Open command palette")
+```
+
+The palette ranks via a tiny case-insensitive subsequence match (extra credit for streaks of consecutive hits) — typing "ese" finds "ESP — Settings", "Esca**lation** **Esc**ape", etc.
+
 ---
 
 ### Callbacks
@@ -1948,7 +2274,7 @@ if not ok then print("set failed:", err) end
 ```
 
 - `object_get` understands every `readable` type — primitives become Lua numbers / bools, `name` and `string` become Lua strings, `Vector`/`Rotator`/`Vector2D` come back as `{ x, y, z }` / `{ pitch, yaw, roll }` / `{ x, y }` tables. Object pointers come back as a child object handle (or `nil` if dead).
-- `object_set` writes only `writable` types: bool, all integer / float kinds, enum, `string` (FString), and the three known structs. **Writes to `FName` are refused** because the comparison-index pool is engine-private. Pointer-typed properties are also refused — there's no safe way to construct a UObject pointer from Lua.
+- `object_set` writes only `writable` types: bool, all integer / float kinds, enum, `string` (FString), `ObjectProperty` / `ClassProperty`, and the three known structs. **Writes to `FName` are refused** because the comparison-index pool is engine-private. Object pointer writes accept a Lua integer object handle (validated against `IsLikelyLiveUObject` before write) or `nil` (writes a null pointer); this lets you set things like `PC->ViewTarget` directly from script. Other pointer kinds are still refused — there's no safe way to construct an arbitrary UObject pointer from Lua.
 
 #### Calling functions
 
@@ -1961,9 +2287,22 @@ local ok, dist = cathack.object_call(actor, "GetDistanceTo", { other_actor })
 ```
 
 `object_call` packs the args table positionally into a UE param buffer and invokes `UObject::ProcessEvent`. Strict whitelist:
-- Allowed param types: `bool`, every integer / float kind, `name`, `string`, `enum`, and the three structs (`Vector`, `Rotator`, `Vector2D`). Functions taking object pointers, classes, arrays, maps, sets, text, or other structs are refused with `safe = false` and an error string.
+- Allowed param types: `bool`, every integer / float kind, `name`, `string`, `enum`, **`ObjectProperty` / `ClassProperty` (pass a Lua object handle integer or `nil`)**, and the three structs (`Vector`, `Rotator`, `Vector2D`). Functions taking arrays, maps, sets, text, or other structs are refused with `safe = false` and a per-param `reason` string in the function metadata.
 - Up to 4 KB of total param size — large struct-heavy functions are refused.
 - The actual `ProcessEvent` call is wrapped in a structured-exception guard. A bad function still hangs the game; a *very* bad function returns `false, "ProcessEvent threw"` instead of crashing the DLL.
+
+```lua
+-- Pass an object handle as an ObjectProperty arg:
+local pc       = cathack.local_player_controller()
+local target   = cathack.find_object("BP_AICharacter_C", "BP_AICharacter_C_42")
+cathack.object_call(pc, "SetViewTargetWithBlend",
+    { target, 0.5, 0 --[[ EViewTargetBlendFunction::VTBlend_Linear ]], 0.0, false })
+
+-- Or clear it:
+cathack.object_call(pc, "SetViewTargetWithBlend", { nil, 0.0, 0, 0.0, false })
+```
+
+`object_functions(id)` and `object_find_functions(id, query)` now also include a per-param `supported` boolean and (when unsupported) a `reason` string, so picker UIs can show e.g. *"param `Items`: TArray params are not supported"* next to the offending arg row.
 
 Returns `ok, value_or_error`:
 - On success with a return parm: `true, return_value`.
@@ -2760,6 +3099,85 @@ end)
 
 ---
 
+### 18. Mini admin tool — palette + keybinds + profiles + watch
+
+A self-contained "admin panel" that wires together the new tooling: persistent keybinds the user can rebind, a command palette opened with F2, profile save/load slots, and a property watch that warns when god-mode flips off mid-fight.
+
+```lua
+-- @autorun
+cathack.log.set_level("info")
+
+-- Persistent keybinds (the user can rebind these in our card below).
+cathack.bind_key("toggle_esp",  0x60, function() cathack.set("esp", not cathack.get("esp")) end, "Toggle ESP")
+cathack.bind_key("toggle_aim",  0x61, function() cathack.set("aimbot", not cathack.get("aimbot")) end, "Toggle aimbot")
+cathack.bind_key("palette",     0x71 --[[ F2 ]], function() cathack.show_command_palette(true) end, "Open palette")
+
+-- Commands the palette will surface.
+cathack.register_command("esp.toggle",  "ESP — Toggle",
+    function() cathack.set("esp", not cathack.get("esp")) end,
+    { description = "Quick on/off for ESP", group = "Visuals" })
+cathack.register_command("aim.toggle",  "Aimbot — Toggle",
+    function() cathack.set("aimbot", not cathack.get("aimbot")) end,
+    { description = "Quick on/off for aim assist", group = "Combat" })
+cathack.register_command("god.warn",    "God-mode — Warn on flip",
+    function() cathack.notify("god watch armed") end,
+    { description = "Re-arm the god-mode flip watch", group = "Debug" })
+
+-- Watch god-mode and notify when it flips off.
+cathack.watch_property(cathack.local_player_controller(), "bGodMode", function(new_v, old_v)
+    if old_v == true and new_v == false then
+        cathack.notify("god mode just flipped OFF")
+        cathack.log.warn("god flipped off", { hp = cathack.local_health() or -1 })
+    end
+end, 250)
+
+-- A small ImGui card the user can pop open to manage everything.
+cathack.on_render(function()
+    if not cathack.menu_open() then return end  -- only when cheat menu is open
+    if cathack.imgui_begin("Admin", false,
+        cathack.imgui.WindowFlags.NoCollapse) then
+
+        if cathack.imgui_card("Hotkeys") then
+            for _, b in ipairs(cathack.keybinds()) do
+                cathack.imgui_text(b.description ~= "" and b.description or b.name)
+                cathack.imgui_same_line()
+                cathack.imgui_keybind_button(b.name)
+            end
+        end
+        cathack.imgui_end_card()
+
+        if cathack.imgui_card("Profiles") then
+            cathack.imgui_subheader("Save")
+            for _, slot in ipairs({ "comp", "casual", "video" }) do
+                if cathack.imgui_button("Save: " .. slot) then
+                    cathack.profile_save(slot, cathack.settings())
+                    cathack.log.info("saved profile " .. slot)
+                end
+                cathack.imgui_same_line()
+                if cathack.imgui_accent_button("Load: " .. slot) then
+                    local p = cathack.profile_load(slot)
+                    if p then for k, v in pairs(p) do cathack.set(k, v) end end
+                end
+            end
+            cathack.imgui_subheader("Layouts")
+            for _, name in ipairs(cathack.layout_list()) do
+                if cathack.imgui_button(name) then cathack.layout_load(name) end
+                cathack.imgui_same_line()
+            end
+            if cathack.imgui_button("Save current as 'admin'") then
+                cathack.layout_save("admin")
+            end
+        end
+        cathack.imgui_end_card()
+    end
+    cathack.imgui_end()
+end)
+```
+
+This script does *no* per-frame polling of its own — the watch and keybinds drive everything from the runtime's tick fan, so cost is negligible.
+
+---
+
 ## Limitations and gotchas
 
 - **`Stop` now unregisters callbacks.** Stop sweeps every `on_tick` / `on_render` callback the script's last `Run` registered (tagged at registration time with the running script's name) and frees them. Lua globals / closures the script defined in the VM are not touched — those stay until you click **Reset VM** or another script reassigns them.
@@ -2769,6 +3187,22 @@ end)
 - **Watchdog: 250 ms per call.** Every chunk execution and every callback invocation has a wall-clock budget (default 250 ms, see `kCallBudgetMs` in `CathackLua.cpp`). If a call exceeds it, the VM raises a Lua error with `call exceeded 250ms wall-clock budget — aborted to keep the game responsive` and longjmps out. The error lands in the console; the VM keeps running. Practical effect: a `while true do end` no longer freezes the game.
 
 - **Persistent storage survives Reset VM.** `cathack.store` / `cathack.fetch` write to disk. Resetting the VM does NOT clear `cathack.store` (intentional — that's the whole point).
+
+- **Timer resolution is ~16 ms.** `set_timeout` / `set_interval` / `watch_property` poll from the same ~60 Hz fan as `on_tick`. Don't rely on them for sub-frame timing — use `on_tick` and integrate `dt` if you need it.
+
+- **Watches fire on the game thread.** Drawing primitives (`cathack.draw_*`) and the ImGui wrappers do nothing inside a watch callback — they only work from inside an `on_render` callback. Use `cathack.queue_render_task(fn)` from a watch to defer to the next render frame if you need to draw.
+
+- **`enum_values` is best-effort.** It probes the candidate `Names` field on `UEnum`'s memory layout. Works for almost every well-formed enum but returns an empty table when the engine version's UEnum layout differs from what we probe. Cache the result if you depend on it; the probe is cheap but not free.
+
+- **Keybinds use `GetAsyncKeyState`.** Bindings fire even when the game window is unfocused — handy for utility scripts but a footgun if you don't gate. Combine with `cathack.menu_open()` or your own focused-check if you want focus-only bindings. The `imgui_keybind_button` capture mode skips mouse VKs (`VK_LBUTTON` … `VK_XBUTTON2`) since those go through ImGui mouse handling; mouse buttons aren't bindable.
+
+- **The command palette steals keyboard input.** While visible, ↑/↓/Enter/Esc are consumed by the palette. Scripts that handle the same keys won't see them until the palette closes. This matches every other command palette implementation; just be aware.
+
+- **`object_call` ObjectProperty args are validated.** Before writing the pointer to the param buffer, the integer handle is run through `IsLikelyLiveUObject`. Stale handles return `false, "object handle is not a live UObject"` instead of crashing. Pass `nil` to write a null pointer.
+
+- **`find_objects` walks the full UObject array.** A wide filter on a big game can iterate 100K+ objects. Set `limit` aggressively (default 256) and prefer `class` (exact) over `class_contains` (substring). The whole walk happens under the Lua mutex on the calling thread — keep it cheap.
+
+- **Profile / layout / keybind files are JSON / INI.** Editable by hand if a script can't load anymore. They live in `%APPDATA%/cathack/lua/{profiles,layouts}/` and `%APPDATA%/cathack/lua/keybinds.json`.
 
 - **Reset VM clears callbacks AND globals.** Reset rebuilds the lua_State from scratch. Anything you stored in Lua globals is gone. Auto-run scripts re-fire after Reset.
 
@@ -3108,4 +3542,82 @@ cathack.pc_view_target() -> entity_id | nil
 cathack.pc_set_view_target(entity_id_or_nil, blend_time?)
 cathack.pc_project_world_to_screen(x, y, z) -> sx, sy | nil
 cathack.pc_deproject_screen_to_world(sx, sy) -> {x,y,z}, {x,y,z} | nil
+
+-- Object browsing
+cathack.count_objects() -> int
+cathack.find_object(class_name, object_name) -> object_id | nil
+cathack.find_objects({ class?, class_contains?, name?, name_contains?, limit? })
+    -> array of object_id
+
+-- Enum reflection
+cathack.find_enum(name) -> object_id | nil
+cathack.enum_values(enum_id) -> { [name] = int_value, ... }
+
+-- ObjectProperty args in object_call
+-- Pass object handles as integers; nil writes a null pointer.
+cathack.object_call(pc, "SetViewTargetWithBlend", { target_id, 0.5 })
+
+-- Vector / rotator / themed widgets
+cathack.imgui_input_vector(label, {x,y,z} [, speed] [, fmt]) -> {x,y,z}, changed
+cathack.imgui_input_rotator(label, {pitch,yaw,roll} [, speed] [, fmt]) -> {p,y,r}, changed
+cathack.imgui_input_vector2(label, {x,y} [, speed] [, fmt]) -> {x,y}, changed
+cathack.imgui_card(title [, w] [, h])  -- always pair with imgui_end_card
+cathack.imgui_end_card()
+cathack.imgui_subheader(text)
+cathack.imgui_toggle(label, value) -> value, changed
+cathack.imgui_accent_button(label [, w] [, h]) -> clicked
+cathack.imgui_danger_button(label [, w] [, h]) -> clicked
+cathack.imgui_combo_enum(label, current_int, values_table_or_enum_id) -> int, changed
+
+-- Script lifecycle (each fan gets the script's name)
+cathack.on_script_load  (function(name) end) -> handle
+cathack.on_script_unload(function(name) end) -> handle
+cathack.on_script_reload(function(name) end) -> handle
+
+-- Timers + async tasks
+cathack.set_timeout (ms, fn) -> handle
+cathack.set_interval(ms, fn) -> handle
+cathack.clear_timer(handle) -> bool
+cathack.queue_task(fn) -> handle           -- runs on next game tick
+cathack.queue_render_task(fn) -> handle    -- runs on next render frame
+
+-- Property watch
+cathack.watch_property(object_id, prop_name, function(new_v, old_v) end [, interval_ms=100])
+    -> handle
+cathack.unwatch(handle) -> bool
+
+-- Logging (cathack.log.*  OR  cathack.log_*)
+cathack.log.debug (msg [, fields_table])
+cathack.log.info  (msg [, fields_table])
+cathack.log.warn  (msg [, fields_table])
+cathack.log.error (msg [, fields_table])
+cathack.log.set_level("debug" | "info" | "warn" | "error")
+cathack.log.level()                         -> "DEBUG"|"INFO"|"WARN"|"ERROR"
+cathack.log.entries([max=200])              -> array of { time_ms, level, text }
+cathack.log.clear()
+
+-- ImGui layout persistence (writes/reads the ImGui ini)
+cathack.layout_save("name")
+cathack.layout_load("name")
+cathack.layout_delete("name")
+cathack.layout_list()                       -> array of names
+
+-- Config profiles
+cathack.profile_save("name", table)         -> bool
+cathack.profile_load("name")                -> table | nil
+cathack.profile_delete("name")              -> bool
+cathack.profile_list()                      -> array of names
+
+-- Keybind manager (persistent, named, user-rebindable)
+cathack.bind_key(name, default_vk, fn [, description])  -> handle
+cathack.unbind_key(name)                    -> bool
+cathack.set_keybind(name, vk)               -> bool
+cathack.keybinds()                          -> array of { name, key, description }
+cathack.imgui_keybind_button(name)          -- "Edit binding" UI, captures next key
+
+-- Command palette
+cathack.register_command(id, title, fn [, { description, group }])  -> handle
+cathack.unregister_command(id)              -> bool
+cathack.commands()                          -> array of { id, title, description, group }
+cathack.show_command_palette(open=true)     -- toggles the fuzzy-search popup
 ```
